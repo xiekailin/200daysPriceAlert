@@ -21,6 +21,14 @@ print(f"[配置] ALERT_DIRECTION: {ALERT_DIRECTION}")
 print(f"[配置] PERCENT_ALERT: {PERCENT_ALERT}")
 print(f"[配置] PERCENT_THRESHOLD: {PERCENT_THRESHOLD}")
 
+# ====== 整数关口列表 ======
+IMPORTANT_LEVELS = [
+    100000, 105000, 110000, 115000, 120000, 125000, 130000, 135000, 140000, 145000, 150000
+]
+
+# ====== 均线列表 ======
+MA_LEVELS = [30, 90, 120]
+
 # ====== 多API获取BTC现价 ======
 def get_btc_price():
     apis = [
@@ -41,82 +49,61 @@ def get_btc_price():
     print('[错误] 所有API获取BTC现价均失败')
     return None
 
-# ====== 多API获取BTC 200日均线 ======
-def get_btc_ma200():
+# ====== 多API获取BTC均线 ======
+def get_btc_ma(days):
     # CoinGecko
     try:
-        print("[请求] CoinGecko获取BTC 200日均线...")
-        url = 'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily'
+        print(f"[请求] CoinGecko获取BTC {days}日均线...")
+        url = f'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days={days}&interval=daily'
         resp = requests.get(url, timeout=10)
         data = resp.json()
         closes = [item[1] for item in data['prices']]
-        ma200 = sum(closes) / len(closes)
-        print(f"[结果] CoinGecko 200日均线: {ma200}")
-        return ma200
+        if len(closes) > days:
+            closes = closes[-days:]
+        ma = sum(closes) / len(closes)
+        print(f"[结果] CoinGecko {days}日均线: {ma:.2f}")
+        return ma
     except Exception as e:
-        print(f"[错误] CoinGecko获取200日均线失败: {e}")
+        print(f"[错误] CoinGecko获取{days}日均线失败: {e}")
     # OKX
     try:
-        print("[请求] OKX获取BTC 200日均线...")
-        url = 'https://www.okx.com/api/v5/market/history-candles?instId=BTC-USDT&bar=1D&limit=200'
+        print(f"[请求] OKX获取BTC {days}日均线...")
+        url = f'https://www.okx.com/api/v5/market/history-candles?instId=BTC-USDT&bar=1D&limit={days}'
         resp = requests.get(url, timeout=10)
         data = resp.json()
         closes = [float(item[4]) for item in data['data']]
-        ma200 = sum(closes) / len(closes)
-        print(f"[结果] OKX 200日均线: {ma200}")
-        return ma200
+        ma = sum(closes) / len(closes)
+        print(f"[结果] OKX {days}日均线: {ma:.2f}")
+        return ma
     except Exception as e:
-        print(f"[错误] OKX获取200日均线失败: {e}")
-    # Coinbase
-    try:
-        print("[请求] Coinbase获取BTC 200日均线...")
-        closes = []
-        for i in range(200):
-            # Coinbase没有历史K线API，只能跳过
-            raise Exception('Coinbase不支持200日均线')
-        # 这里不会执行
-    except Exception as e:
-        print(f"[错误] Coinbase获取200日均线失败: {e}")
+        print(f"[错误] OKX获取{days}日均线失败: {e}")
     # Bitstamp
     try:
-        print("[请求] Bitstamp获取BTC 200日均线...")
-        url = 'https://www.bitstamp.net/api/v2/ohlc/btcusd/?step=86400&limit=200'
+        print(f"[请求] Bitstamp获取BTC {days}日均线...")
+        url = f'https://www.bitstamp.net/api/v2/ohlc/btcusd/?step=86400&limit={days}'
         resp = requests.get(url, timeout=10)
         data = resp.json()
         closes = [float(item['close']) for item in data['data']['ohlc']]
-        ma200 = sum(closes) / len(closes)
-        print(f"[结果] Bitstamp 200日均线: {ma200}")
-        return ma200
+        ma = sum(closes) / len(closes)
+        print(f"[结果] Bitstamp {days}日均线: {ma:.2f}")
+        return ma
     except Exception as e:
-        print(f"[错误] Bitstamp获取200日均线失败: {e}")
+        print(f"[错误] Bitstamp获取{days}日均线失败: {e}")
     # Kraken
     try:
-        print("[请求] Kraken获取BTC 200日均线...")
+        print(f"[请求] Kraken获取BTC {days}日均线...")
         url = 'https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440&since=0'
         resp = requests.get(url, timeout=10)
         data = resp.json()
         closes = [float(item[4]) for item in list(data['result'].values())[0] if isinstance(item, list)]
-        closes = closes[-200:]
-        ma200 = sum(closes) / len(closes)
-        print(f"[结果] Kraken 200日均线: {ma200}")
-        return ma200
+        closes = closes[-days:]
+        ma = sum(closes) / len(closes)
+        print(f"[结果] Kraken {days}日均线: {ma:.2f}")
+        return ma
     except Exception as e:
-        print(f"[错误] Kraken获取200日均线失败: {e}")
-    print('[错误] 所有API获取200日均线均失败')
+        print(f"[错误] Kraken获取{days}日均线失败: {e}")
+    print(f'[错误] 所有API获取{days}日均线均失败')
     return None
-
-# ====== 发送Bark推送 ======
-def send_bark_alert(price, threshold):
-    title = 'BTC价格预警'
-    body = f'BTC价格${price:.2f}已跌破阈值${threshold:.2f}'
-    for key in BARK_API_KEYS:
-        url = f"{BARK_API_URL_TEMPLATE.format(key)}{title}/{body}"
-        print(f"[推送] 发送Bark通知: {url}")
-        try:
-            resp = requests.get(url)
-            print(f'[推送] 已发送推送通知，返回状态码: {resp.status_code}')
-        except Exception as e:
-            print(f'[错误] 推送失败: {e}')
 
 # ====== 获取24小时涨跌幅百分比 ======
 def get_btc_24h_change():
@@ -145,39 +132,70 @@ def get_btc_24h_change():
     print('[错误] 所有API获取24小时涨跌幅均失败')
     return None
 
+# ====== 发送Bark推送 ======
+def send_bark_alert(body_msg):
+    title = 'BTC价格预警'
+    body = body_msg
+    for key in BARK_API_KEYS:
+        url = f"{BARK_API_URL_TEMPLATE.format(key)}{title}/{body}"
+        print(f"[推送] 发送Bark通知: {url.replace(key, '***')}")
+        try:
+            resp = requests.get(url)
+            print(f'[推送] 已发送推送通知，返回状态码: {resp.status_code}')
+        except Exception as e:
+            print(f'[错误] 推送失败: {e}')
+
 # ====== 主循环 ======
 if __name__ == '__main__':
     if USE_MA200:
-        threshold = get_btc_ma200()
-        print(f'[主流程] 使用200日均线作为阈值: {threshold}')
+        threshold = get_btc_ma(200)
+        print(f'[主流程] 使用200日均线作为主要阈值: {threshold}')
     else:
         threshold = float(ALERT_PRICE) if ALERT_PRICE else 60000
         print(f'[主流程] 使用固定阈值: {threshold}')
+    
+    # Calculate important MAs
+    ma_values = {}
+    print('[主流程] 开始计算需要监控的均线...')
+    for days in MA_LEVELS:
+        ma_value = get_btc_ma(days)
+        if ma_value:
+            ma_values[days] = ma_value
+            print(f'[主流程] MA{days}: {ma_value:.2f}')
+
     while True:
         price = get_btc_price()
-        alert_triggered = False
-        alert_msg = ''
+        alert_reasons = []
         if price is not None:
-            print(f'[主流程] 当前BTC价格：{price}，阈值：{threshold}')
-            # 双向预警
+            # Threshold check
             if ALERT_DIRECTION in ['down', 'both'] and price < threshold:
-                alert_triggered = True
-                alert_msg = f'BTC价格${price:.2f}已跌破阈值${threshold:.2f}'
+                alert_reasons.append(f'已跌破阈值${threshold:.2f}')
             if ALERT_DIRECTION in ['up', 'both'] and price > threshold:
-                alert_triggered = True
-                alert_msg = f'BTC价格${price:.2f}已涨破阈值${threshold:.2f}'
-            # 百分比涨跌幅预警
+                alert_reasons.append(f'已涨破阈值${threshold:.2f}')
+
+            # Percent change check
             if PERCENT_ALERT:
                 percent = get_btc_24h_change()
                 if percent is not None and abs(percent) >= PERCENT_THRESHOLD:
-                    alert_triggered = True
-                    alert_msg += f' | 24小时涨跌幅：{percent:.2f}%'
-            if alert_triggered:
-                print(f'[主流程] 触发预警，准备推送...')
-                send_bark_alert(price, threshold)
-                break  # 只推送一次，推送后退出。如需持续推送可去掉这行
+                    alert_reasons.append(f'24h涨跌幅: {percent:.2f}%')
+
+            # Integer level check
+            for level in IMPORTANT_LEVELS:
+                if abs(price - level) < 100:  # 离关口100美元内提醒
+                    alert_reasons.append(f'接近整数关口:${level}')
+            
+            # MA level check
+            for days, ma_value in ma_values.items():
+                if abs(price - ma_value) < 100: # 价格距离均线100美元以内
+                    alert_reasons.append(f'接近MA({days})均线:${ma_value:.2f}')
+            
+            if alert_reasons:
+                alert_msg = f'BTC当前价: ${price:.2f} | ' + ' | '.join(alert_reasons)
+                print(f'[主流程] 触发预警，准备推送: {alert_msg}')
+                send_bark_alert(alert_msg)
+                break
             else:
-                print(f'[主流程] 未触发任何预警，无需推送。')
+                print(f'[主流程] 当前BTC价格: ${price:.2f}，未触发任何预警，无需推送。')
         else:
             print('[主流程] 获取价格失败，等待重试...')
         time.sleep(CHECK_INTERVAL) 
