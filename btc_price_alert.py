@@ -3,8 +3,9 @@ import time
 import os
 
 # ====== 配置部分 ======
-BARK_API_KEY = os.getenv('BARK_API_KEY', 'Znodd8yskndqUUbMVnmzBn')  # 建议用GitHub Secrets设置
-BARK_API_URL = f'https://api.day.app/{BARK_API_KEY}/'
+BARK_API_KEY = os.getenv('BARK_API_KEY', 'Znodd8yskndqUUbMVnmzBn')  # 多个key用英文逗号分隔
+BARK_API_KEYS = [k.strip() for k in BARK_API_KEY.split(',') if k.strip()]
+BARK_API_URL_TEMPLATE = 'https://api.day.app/{}/'
 ALERT_PRICE = os.getenv('ALERT_PRICE')  # 可以设置为具体价格
 USE_MA200 = os.getenv('USE_MA200', 'false').lower() == 'true'  # 是否用200日均线
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '2'))  # 检查频率（秒），默认2秒
@@ -107,14 +108,15 @@ def get_btc_ma200():
 # ====== 发送Bark推送 ======
 def send_bark_alert(price, threshold):
     title = 'BTC价格预警'
-    body = f'BTC价格${price:.2f}已跌破了阈值${threshold:.2f}'
-    url = f"{BARK_API_URL}{title}/{body}"
-    print(f"[推送] 发送Bark通知: {url}")
-    try:
-        resp = requests.get(url)
-        print(f'[推送] 已发送推送通知，返回状态码: {resp.status_code}')
-    except Exception as e:
-        print(f'[错误] 推送失败: {e}')
+    body = f'BTC价格${price:.2f}已跌破阈值${threshold:.2f}'
+    for key in BARK_API_KEYS:
+        url = f"{BARK_API_URL_TEMPLATE.format(key)}{title}/{body}"
+        print(f"[推送] 发送Bark通知: {url}")
+        try:
+            resp = requests.get(url)
+            print(f'[推送] 已发送推送通知，返回状态码: {resp.status_code}')
+        except Exception as e:
+            print(f'[错误] 推送失败: {e}')
 
 # ====== 获取24小时涨跌幅百分比 ======
 def get_btc_24h_change():
