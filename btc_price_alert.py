@@ -14,34 +14,89 @@ print(f"[配置] ALERT_PRICE: {ALERT_PRICE}")
 print(f"[配置] USE_MA200: {USE_MA200}")
 print(f"[配置] CHECK_INTERVAL: {CHECK_INTERVAL}")
 
-# ====== 获取BTC现价函数 ======
+# ====== 多API获取BTC现价 ======
 def get_btc_price():
-    try:
-        url = 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT'
-        print(f"[请求] 获取BTC现价: {url}")
-        resp = requests.get(url, timeout=5)
-        data = resp.json()
-        price = float(data['price'])
-        print(f"[结果] 当前BTC价格: {price}")
-        return price
-    except Exception as e:
-        print(f'[错误] 获取价格失败: {e}')
-        return None
+    apis = [
+        ('CoinGecko', lambda: requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', timeout=5).json()['bitcoin']['usd']),
+        ('OKX', lambda: float(requests.get('https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT', timeout=5).json()['data'][0]['last'])),
+        ('Coinbase', lambda: float(requests.get('https://api.coinbase.com/v2/prices/spot?currency=USD', timeout=5).json()['data']['amount'])),
+        ('Bitstamp', lambda: float(requests.get('https://www.bitstamp.net/api/v2/ticker/btcusd/', timeout=5).json()['last'])),
+        ('Kraken', lambda: float(requests.get('https://api.kraken.com/0/public/Ticker?pair=XBTUSD', timeout=5).json()['result']['XXBTZUSD']['c'][0]))
+    ]
+    for name, func in apis:
+        try:
+            print(f"[请求] 尝试{name}获取BTC现价...")
+            price = func()
+            print(f"[结果] {name} BTC价格: {price}")
+            return float(price)
+        except Exception as e:
+            print(f"[错误] {name}获取失败: {e}")
+    print('[错误] 所有API获取BTC现价均失败')
+    return None
 
-# ====== 获取BTC 200日均线 ======
+# ====== 多API获取BTC 200日均线 ======
 def get_btc_ma200():
+    # CoinGecko
     try:
-        url = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=200'
-        print(f"[请求] 获取BTC 200日均线: {url}")
+        print("[请求] CoinGecko获取BTC 200日均线...")
+        url = 'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=200&interval=daily'
         resp = requests.get(url, timeout=10)
         data = resp.json()
-        closes = [float(item[4]) for item in data]  # 收盘价
+        closes = [item[1] for item in data['prices']]
         ma200 = sum(closes) / len(closes)
-        print(f"[结果] 200日均线: {ma200}")
+        print(f"[结果] CoinGecko 200日均线: {ma200}")
         return ma200
     except Exception as e:
-        print(f'[错误] 获取MA200失败: {e}')
-        return None
+        print(f"[错误] CoinGecko获取200日均线失败: {e}")
+    # OKX
+    try:
+        print("[请求] OKX获取BTC 200日均线...")
+        url = 'https://www.okx.com/api/v5/market/history-candles?instId=BTC-USDT&bar=1D&limit=200'
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        closes = [float(item[4]) for item in data['data']]
+        ma200 = sum(closes) / len(closes)
+        print(f"[结果] OKX 200日均线: {ma200}")
+        return ma200
+    except Exception as e:
+        print(f"[错误] OKX获取200日均线失败: {e}")
+    # Coinbase
+    try:
+        print("[请求] Coinbase获取BTC 200日均线...")
+        closes = []
+        for i in range(200):
+            # Coinbase没有历史K线API，只能跳过
+            raise Exception('Coinbase不支持200日均线')
+        # 这里不会执行
+    except Exception as e:
+        print(f"[错误] Coinbase获取200日均线失败: {e}")
+    # Bitstamp
+    try:
+        print("[请求] Bitstamp获取BTC 200日均线...")
+        url = 'https://www.bitstamp.net/api/v2/ohlc/btcusd/?step=86400&limit=200'
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        closes = [float(item['close']) for item in data['data']['ohlc']]
+        ma200 = sum(closes) / len(closes)
+        print(f"[结果] Bitstamp 200日均线: {ma200}")
+        return ma200
+    except Exception as e:
+        print(f"[错误] Bitstamp获取200日均线失败: {e}")
+    # Kraken
+    try:
+        print("[请求] Kraken获取BTC 200日均线...")
+        url = 'https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440&since=0'
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        closes = [float(item[4]) for item in list(data['result'].values())[0] if isinstance(item, list)]
+        closes = closes[-200:]
+        ma200 = sum(closes) / len(closes)
+        print(f"[结果] Kraken 200日均线: {ma200}")
+        return ma200
+    except Exception as e:
+        print(f"[错误] Kraken获取200日均线失败: {e}")
+    print('[错误] 所有API获取200日均线均失败')
+    return None
 
 # ====== 发送Bark推送 ======
 def send_bark_alert(price, threshold):
