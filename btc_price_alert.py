@@ -117,19 +117,20 @@ def run_alert_mode():
     alert_reasons = []
     levels_to_check = {}
     
-    # 1. 主阈值
-    if USE_MA200:
-        threshold = get_btc_ma(200)
-        if threshold: levels_to_check[f'MA(200)阈值 ${threshold:,.0f}'] = threshold
-    elif ALERT_PRICE:
-        levels_to_check[f'固定阈值 ${float(ALERT_PRICE):,.0f}'] = float(ALERT_PRICE)
+    # 1. 固定价格阈值 (仅在不使用MA200时生效)
+    if not USE_MA200 and ALERT_PRICE:
+        try:
+            levels_to_check[f'固定阈值 ${float(ALERT_PRICE):,.0f}'] = float(ALERT_PRICE)
+        except (ValueError, TypeError):
+            print(f"[警告] 无效的 ALERT_PRICE 值: {ALERT_PRICE}")
 
     # 2. 整数关口
     for level in IMPORTANT_LEVELS:
         levels_to_check[f'整数关口 ${level:,}'] = level
         
-    # 3. MA均线
-    for days in MA_LEVELS:
+    # 3. MA均线 (包含MA200, 如果启用)
+    all_ma_days = sorted(list(set(MA_LEVELS + ([200] if USE_MA200 else []))))
+    for days in all_ma_days:
         ma = get_btc_ma(days)
         if ma: levels_to_check[f'MA({days}) ${ma:,.0f}'] = ma
 
