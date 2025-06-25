@@ -1,0 +1,26 @@
+name: BTC Price Alert
+
+on:
+  schedule:
+    - cron: '*/3 * * * *'  # 每1分钟运行一次
+  workflow_dispatch:
+
+jobs:
+  alert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run BTC price alert
+        env:
+          BARK_API_KEY: ${{ secrets.BARK_API_KEY }}
+          ALERT_PRICE: ${{ secrets.ALERT_PRICE }}
+          USE_MA200: ${{ secrets.USE_MA200 }}
+          CHECK_INTERVAL: '1'  # 只检查一次就退出
+        run: python btc_price_alert.py 
