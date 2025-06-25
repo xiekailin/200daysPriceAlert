@@ -1,11 +1,11 @@
 name: BTC Price Alert
 
 on:
-  schedule:
-    # 每天上午9点和晚上9点 (UTC+8) 发送报告
-    - cron: '0 1,13 * * *'
-    # 每5分钟检查一次关键点位
-    - cron: '*/5 * * * *'
+  # schedule:
+  #   # 每天上午9点和晚上9点 (UTC+8) 发送报告
+  #   - cron: '0 1,13 * * *'
+  #   # 每5分钟检查一次关键点位
+  #   - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       mode:
