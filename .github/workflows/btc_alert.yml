@@ -2,7 +2,7 @@ name: BTC Price Alert
 
 on:
   schedule:
-    - cron: '*/3 * * * *'  # 每1分钟运行一次
+    - cron: '*/2 * * * *'  # 每1分钟运行一次
   workflow_dispatch:
 
 jobs:

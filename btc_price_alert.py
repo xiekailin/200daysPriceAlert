@@ -9,7 +9,7 @@ ALERT_PRICE = os.getenv('ALERT_PRICE')  # 可以设置为具体价格
 USE_MA200 = os.getenv('USE_MA200', 'false').lower() == 'true'  # 是否用200日均线
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '60'))  # 检查频率（秒）
 
-# ====== 获取BTC现价函数 ======
+# ====== 获取BTC现价函数 ======出发
 def get_btc_price():
     try:
         url = 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT'
