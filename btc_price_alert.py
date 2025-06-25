@@ -7,7 +7,7 @@ BARK_API_KEY = os.getenv('BARK_API_KEY', 'Znodd8yskndqUUbMVnmzBn')  # 建议用G
 BARK_API_URL = f'https://api.day.app/{BARK_API_KEY}/'
 ALERT_PRICE = os.getenv('ALERT_PRICE')  # 可以设置为具体价格
 USE_MA200 = os.getenv('USE_MA200', 'false').lower() == 'true'  # 是否用200日均线
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '60'))  # 检查频率（秒）
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '2'))  # 检查频率（秒），默认2秒
 
 print(f"[配置] BARK_API_KEY: {'已设置' if BARK_API_KEY else '未设置'}")
 print(f"[配置] ALERT_PRICE: {ALERT_PRICE}")
