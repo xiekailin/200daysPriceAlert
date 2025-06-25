@@ -2,12 +2,21 @@ name: BTC Price Alert
 
 on:
   schedule:
-    - cron: '*/2 * * * *'  # 每1分钟运行一次
+    # 每天上午9点和晚上9点 (UTC+8) 发送报告
+    - cron: '0 1,13 * * *'
+    # 每5分钟检查一次关键点位
+    - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式: 'alert' (预警) 或 'report' (报告)"
+        required: true
+        default: 'alert'
 
 jobs:
-  alert:
+  daily-report:
     runs-on: ubuntu-latest
+    if: github.event.schedule == '0 1,13 * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'report')
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -17,10 +26,35 @@ jobs:
           python-version: '3.10'
       - name: Install dependencies
         run: pip install requests
-      - name: Run BTC price alert
+      - name: Run BTC Price Report
         env:
+          ALERT_MODE: 'report'
           BARK_API_KEY: ${{ secrets.BARK_API_KEY }}
-          ALERT_PRICE: ${{ secrets.ALERT_PRICE }}
           USE_MA200: ${{ secrets.USE_MA200 }}
-          CHECK_INTERVAL: '1'  # 只检查一次就退出
+        run: python btc_price_alert.py
+
+  key-level-alert:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '*/5 * * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'alert')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - name: Cache last price
+        uses: actions/cache@v3
+        id: price-cache
+        with:
+          path: last_price.cache
+          key: ${{ runner.os }}-last-price
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run BTC Key Level Alert
+        env:
+          ALERT_MODE: 'alert'
+          BARK_API_KEY: ${{ secrets.BARK_API_KEY }}
+          USE_MA200: ${{ secrets.USE_MA200 }}
+          ALERT_PRICE: ${{ secrets.ALERT_PRICE }}
         run: python btc_price_alert.py 
