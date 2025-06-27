@@ -2,6 +2,7 @@ import requests
 import time
 import os
 import datetime
+import json
 
 def log(msg):
     print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
@@ -131,6 +132,115 @@ def run_report_mode():
     log(f"[报告内容] {report_msg}")
     send_bark_alert(report_msg)
 
+class SmartAlertManager:
+    def __init__(self, cooldown_minutes=15, breakthrough_threshold=0.2):
+        self.cooldown_minutes = cooldown_minutes
+        self.breakthrough_threshold = breakthrough_threshold  # 突破确认阈值（百分比）
+        self.cooldown_file = 'cooldown_cache.json'  # 冷却期缓存文件
+        self.price_states = {}     # 记录每个关口的当前状态
+        self.first_breakthrough = {}  # 记录每个关口是否已经首次突破
+    
+    def load_cooldown_data(self):
+        """从文件加载冷却期数据"""
+        try:
+            if os.path.exists(self.cooldown_file):
+                with open(self.cooldown_file, 'r') as f:
+                    data = json.load(f)
+                    log(f"[缓存] 加载冷却期数据: {len(data)} 个关口")
+                    return data
+        except Exception as e:
+            log(f"[警告] 加载冷却期数据失败: {e}")
+        return {}
+    
+    def save_cooldown_data(self, data):
+        """保存冷却期数据到文件"""
+        try:
+            with open(self.cooldown_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            log(f"[缓存] 保存冷却期数据: {len(data)} 个关口")
+        except Exception as e:
+            log(f"[错误] 保存冷却期数据失败: {e}")
+    
+    def can_alert(self, level_name, prev_price, current_price, level):
+        """综合判断是否可以推送预警"""
+        current_time = time.time()
+        
+        # 加载冷却期数据
+        last_alert_time = self.load_cooldown_data()
+        
+        # 1. 首次突破：立即提示，只要穿越关口就提示
+        if level_name not in self.first_breakthrough:
+            # 检查是否穿越关口
+            if prev_price < level <= current_price:  # 涨破
+                self.first_breakthrough[level_name] = "涨破"
+                last_alert_time[level_name] = current_time
+                self.save_cooldown_data(last_alert_time)
+                self.price_states[level_name] = self.get_price_state(current_price, level)
+                log(f"[首次突破] {level_name} 涨破")
+                return True, "涨破"
+            elif prev_price > level >= current_price:  # 跌破
+                self.first_breakthrough[level_name] = "跌破"
+                last_alert_time[level_name] = current_time
+                self.save_cooldown_data(last_alert_time)
+                self.price_states[level_name] = self.get_price_state(current_price, level)
+                log(f"[首次突破] {level_name} 跌破")
+                return True, "跌破"
+            return False, None
+        
+        # 2. 后续突破：需要满足确认距离和冷却时间
+        is_breakthrough, direction = self.is_real_breakthrough(prev_price, current_price, level)
+        if not is_breakthrough:
+            return False, None
+        
+        # 检查冷却时间（每个关口独立冷却）
+        if level_name in last_alert_time:
+            time_diff = current_time - last_alert_time[level_name]
+            remaining_time = (self.cooldown_minutes * 60) - time_diff
+            if time_diff < self.cooldown_minutes * 60:
+                log(f"[防震荡] {level_name} 在冷却期内，剩余 {remaining_time:.0f}秒，跳过推送")
+                return False, None
+            else:
+                log(f"[冷却] {level_name} 冷却期已过，可以推送")
+        else:
+            log(f"[冷却] {level_name} 首次检查，无冷却记录")
+        
+        # 检查状态变化
+        current_state = self.get_price_state(current_price, level)
+        if level_name in self.price_states:
+            old_state = self.price_states[level_name]
+            if old_state == current_state:
+                log(f"[防震荡] {level_name} 状态未变化，跳过推送")
+                return False, None
+        
+        # 更新状态和时间
+        self.price_states[level_name] = current_state
+        last_alert_time[level_name] = current_time
+        self.save_cooldown_data(last_alert_time)
+        
+        return True, direction
+    
+    def is_real_breakthrough(self, prev_price, current_price, level):
+        """判断是否真正突破，需要穿越一定距离"""
+        threshold = level * self.breakthrough_threshold / 100
+        
+        if prev_price < level and current_price > level + threshold:
+            return True, "涨破"
+        elif prev_price > level and current_price < level - threshold:
+            return True, "跌破"
+        return False, None
+    
+    def get_price_state(self, current_price, level):
+        """获取价格相对于关口的状态"""
+        if current_price > level + (level * 0.1 / 100):  # 高于关口0.1%
+            return "above"
+        elif current_price < level - (level * 0.1 / 100):  # 低于关口0.1%
+            return "below"
+        else:
+            return "near_level"
+
+# 创建智能预警管理器
+alert_manager = SmartAlertManager(cooldown_minutes=15, breakthrough_threshold=0.2)
+
 def run_alert_mode():
     log('[主流程] 进入关键点位预警模式...')
     prev_price = None
@@ -174,17 +284,19 @@ def run_alert_mode():
         if ma: levels_to_check[f'MA({days}) ${ma:,.0f}'] = ma
 
     for name, level in levels_to_check.items():
-        if prev_price < level <= current_price:
-            alert_reasons.append(f"🔴 🔺 涨破 {name}")
-        if prev_price > level >= current_price:
-            alert_reasons.append(f"🟢 🔻 跌破 {name}")
+        can_alert, direction = alert_manager.can_alert(name, prev_price, current_price, level)
+        if can_alert:
+            if direction == "涨破":
+                alert_reasons.append(f"🔴 🔺 涨破 {name}")
+            elif direction == "跌破":
+                alert_reasons.append(f"🟢 🔻 跌破 {name}")
 
     if alert_reasons:
-        alert_msg = f"💰 现价: ${current_price:,.2f}\n" + "\n".join(alert_reasons)
+        alert_msg = f"💰 现价: ${current_price:,.2f}\n\n" + "\n".join(alert_reasons)
         log(f"[预警] {alert_msg}")
         send_bark_alert(alert_msg)
     else:
-        log(f"[主流程] 价格从 ${prev_price:,.2f} -> ${current_price:,.2f}, 未穿越关键点位。")
+        log(f"[主流程] 价格从 ${prev_price:,.2f} -> ${current_price:,.2f}, 未触发有效预警。")
 
     with open(CACHE_PATH, 'w') as f:
         f.write(str(current_price))
