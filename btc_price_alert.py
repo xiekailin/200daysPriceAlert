@@ -5,7 +5,7 @@ import datetime
 import json
 
 LOG_PATH = 'btc_alert.log'
-MAX_LOG_SIZE = 20 * 1024 * 1024  # 20MB
+MAX_LOG_SIZE = 5 * 1024 * 1024  # 5MB
 
 def log(msg):
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -37,7 +37,7 @@ ALERT_MODE = os.getenv('ALERT_MODE', 'alert')  # 'alert' 或 'report'
 CACHE_PATH = 'last_price.cache'
 
 # ====== 关口与均线列表 ======
-IMPORTANT_LEVELS = list(range(100000, 200001, 1000))
+IMPORTANT_LEVELS = list(range(100000, 200001, 500))
 MA_LEVELS = [30, 90, 120]
 
 log(f"[配置] ALERT_MODE: {ALERT_MODE}")
@@ -65,46 +65,48 @@ def get_btc_price():
     return None
 
 def get_btc_ma(days):
-    # Bitstamp
-    try:
+    def get_from_kraken():
+        url = 'https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440&since=0'
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        # Kraken might return more than `days` data, so we slice it
+        closes = [float(item[4]) for item in list(data['result'].values())[0] if isinstance(item, list)]
+        closes = closes[-days:]
+        return sum(closes) / len(closes)
+
+    def get_from_bitstamp():
         url = f'https://www.bitstamp.net/api/v2/ohlc/btcusd/?step=86400&limit={days}'
         resp = requests.get(url, timeout=10)
         data = resp.json()
         closes = [float(item['close']) for item in data['data']['ohlc']]
-        ma = sum(closes) / len(closes)
-        log(f"[结果] Bitstamp {days}日均线: {ma:.2f}")
-        return ma
-    except Exception as e:
-        log(f"[错误] Bitstamp 获取 MA({days}) 失败: {e}")
-    # CoinGecko
-    try:
+        return sum(closes) / len(closes)
+
+    def get_from_coingecko():
         url = f'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days={days}&interval=daily'
         resp = requests.get(url, timeout=10)
         data = resp.json()
         if 'prices' not in data:
-            log(f"[错误] CoinGecko 返回数据缺少 'prices' 字段: {data}")
             raise Exception("No 'prices' in response")
         prices = [item[1] for item in data['prices']]
+        # CoinGecko might return more than `days` data points
         if len(prices) > days:
             prices = prices[-days:]
-        ma = sum(prices) / len(prices)
-        log(f"[结果] CoinGecko {days}日均线: {ma:.2f}")
-        return ma
-    except Exception as e:
-        log(f"[错误] CoinGecko 获取 MA({days}) 失败: {e}")
-    # Kraken
-    try:
-        url = f'https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440&since=0'
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        closes = [float(item[4]) for item in list(data['result'].values())[0] if isinstance(item, list)]
-        closes = closes[-days:]
-        ma = sum(closes) / len(closes)
-        log(f"[结果] Kraken {days}日均线: {ma:.2f}")
-        return ma
-    except Exception as e:
-        log(f"[错误] Kraken 获取 MA({days}) 失败: {e}")
-    # CryptoCompare（仅支持现价，不支持历史K线，无法做均线）
+        return sum(prices) / len(prices)
+
+    apis = [
+        ('Kraken', get_from_kraken),
+        ('CoinGecko', get_from_coingecko),
+        ('Bitstamp', get_from_bitstamp),
+    ]
+
+    for name, func in apis:
+        try:
+            ma = func()
+            log(f"[结果] 通过 {name} 获取到 {days}日均线: {ma:.2f}")
+            return ma
+        except Exception as e:
+            log(f"[错误] {name} 获取 MA({days}) 失败: {e}")
+
     log(f'[错误] 所有API获取{days}日均线均失败')
     return None
 
@@ -183,39 +185,30 @@ class SmartAlertManager:
         cooldown_minutes = self.cooldown_minutes
         cooldown_data = self.cooldown_data
         current_state = self.get_price_state(current_price, level)
+        cooldown_total = int(cooldown_minutes * 60)
 
-        # 1. 冷却期内，直接跳过
+        # 冷却期内，直接跳过
         if level_name in cooldown_data:
-            # 兼容旧格式（float/int）
             if isinstance(cooldown_data[level_name], (float, int)):
                 cooldown_data[level_name] = {"time": cooldown_data[level_name], "state": None}
                 self.save_cooldown_data()
             last_time = cooldown_data[level_name].get("time", 0)
-            last_state = cooldown_data[level_name].get("state", None)
             time_diff = current_time - last_time
-            if time_diff < cooldown_minutes * 60:
-                # 冷却期内
+            if time_diff < cooldown_total:
+                remain = int(cooldown_total - time_diff)
+                log(f"[冷却期中] {level_name} 跳过推送 | 当前: {current_time:.0f} 上次: {last_time:.0f} 剩余: {remain}s/共{cooldown_total}s")
                 return False, None
-            else:
-                # 冷却期已过，只有状态发生变化且实际推送时才写入
-                if last_state is not None and last_state != current_state:
-                    direction = "涨破" if current_state == "above" else ("跌破" if current_state == "below" else "穿越")
-                    # 只有实际推送时才写入
-                    cooldown_data[level_name] = {"time": current_time, "state": current_state}
-                    self.save_cooldown_data()
-                    log(f"[冷却后状态变化] {level_name} 状态由 {last_state} 变为 {current_state}，推送一次")
-                    return True, direction
-                else:
-                    # 状态没变，不推送
-                    return False, None
-        # 2. 首次突破或新关口
+
+        # 只有穿越关口时才推送
         is_breakthrough, direction = self.is_real_breakthrough(prev_price, current_price, level)
         if is_breakthrough:
-            # 只有实际推送时才写入
-            cooldown_data[level_name] = {"time": current_time, "state": current_state}
+            # 只保留当前关口的冷却期，清空其他关口
+            self.cooldown_data = {level_name: {"time": current_time, "state": current_state}}
             self.save_cooldown_data()
+            log(f"[进入冷却期] {level_name} {direction}，冷却期开始: {current_time:.0f}（其他关口冷却已清空）")
             log(f"[首次/新突破] {level_name} {direction}")
             return True, direction
+
         return False, None
     
     def is_real_breakthrough(self, prev_price, current_price, level):
@@ -277,18 +270,27 @@ def run_alert_mode():
     all_ma_days = sorted(list(set(MA_LEVELS + ([200] if USE_MA200 else []))))
     for days in all_ma_days:
         ma = get_btc_ma(days)
-        if ma: levels_to_check[f'MA({days}) ${ma:,.0f}'] = ma
+        if ma: 
+            levels_to_check[f'MA({days})'] = ma
 
     for name, level in levels_to_check.items():
         can_alert, direction = alert_manager.can_alert(name, prev_price, current_price, level)
         if can_alert:
+            # 为MA均线添加价格信息到显示中
+            display_name = name
+            if name.startswith('MA('):
+                display_name = f"{name} ${level:,.0f}"
+            
             if direction == "涨破":
-                alert_reasons.append(f"🔴 🔺 涨破 {name}")
+                # 用 🔺 表示涨破 (通常为红色)
+                alert_reasons.append(f"🔺 涨破 {display_name}")
             elif direction == "跌破":
-                alert_reasons.append(f"🟢 🔻 跌破 {name}")
+                # 用 📉 表示跌破 (通常为绿色)
+                alert_reasons.append(f"📉 跌破 {display_name}")
 
     if alert_reasons:
-        alert_msg = f"💰 现价: ${current_price:,.2f}\n\n" + "\n".join(alert_reasons)
+        # 将所有预警理由在一行内展示
+        alert_msg = f"💰 现价: ${current_price:,.2f}  " + "  ".join(alert_reasons)
         log(f"[预警] {alert_msg}")
         send_bark_alert(alert_msg)
     else:
