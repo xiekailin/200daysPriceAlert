@@ -4,28 +4,48 @@ import os
 import datetime
 import json
 
-LOG_PATH = 'btc_alert.log'
+LOG_PATH = '/root/btc_alert.log'
 MAX_LOG_SIZE = 5 * 1024 * 1024  # 5MB
 
 def log(msg):
     now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     line = f"[{now}] {msg}\n"
+    
+    # 先检查文件大小，如果超过限制就裁剪
+    try:
+        if os.path.exists(LOG_PATH):
+            current_size = os.path.getsize(LOG_PATH)
+            
+            if current_size > MAX_LOG_SIZE:
+                # 读取文件内容
+                with open(LOG_PATH, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                
+                # 保留最后约4MB的内容（留一些缓冲空间）
+                target_size = 4 * 1024 * 1024
+                current_size = 0
+                kept_lines = []
+                
+                # 从后往前计算，保留不超过4MB的内容
+                for line in reversed(lines):
+                    line_size = len(line.encode('utf-8'))
+                    if current_size + line_size > target_size:
+                        break
+                    kept_lines.insert(0, line)
+                    current_size += line_size
+                
+                # 重写文件
+                with open(LOG_PATH, 'w', encoding='utf-8') as f:
+                    f.writelines(kept_lines)
+                
+                print(f"[日志裁剪] 文件大小超过{MAX_LOG_SIZE/1024/1024:.1f}MB，已裁剪至{current_size/1024/1024:.1f}MB")
+    except Exception as e:
+        print(f"[日志裁剪错误] {e}")
+    
+    # 写入新日志
     with open(LOG_PATH, 'a', encoding='utf-8') as f:
         f.write(line)
     print(line.strip())  # 保留原有print调试
-    # 裁剪日志
-    try:
-        if os.path.getsize(LOG_PATH) > MAX_LOG_SIZE:
-            with open(LOG_PATH, 'rb') as f:
-                f.seek(-MAX_LOG_SIZE, os.SEEK_END)
-                data = f.read()
-            with open(LOG_PATH, 'wb') as f:
-                f.write(data)
-            # 可能会截断一行，补一个换行
-            with open(LOG_PATH, 'ab') as f:
-                f.write(b'\n')
-    except Exception as e:
-        print(f"[日志裁剪错误] {e}")
 
 # ====== 配置部分 ======
 BARK_API_KEY = os.getenv('BARK_API_KEY', 'Znodd8yskndqUUbMVnmzBn') # 多个key用英文逗号分隔
@@ -34,10 +54,10 @@ BARK_API_URL_TEMPLATE = 'https://api.day.app/{}/'
 ALERT_PRICE = os.getenv('ALERT_PRICE')
 USE_MA200 = os.getenv('USE_MA200', 'false').lower() == 'true'
 ALERT_MODE = os.getenv('ALERT_MODE', 'alert')  # 'alert' 或 'report'
-CACHE_PATH = 'last_price.cache'
+CACHE_PATH = '/root/last_price.cache'
 
 # ====== 关口与均线列表 ======
-IMPORTANT_LEVELS = list(range(100000, 200001, 500))
+IMPORTANT_LEVELS = list(range(40000, 1000000, 1000))
 MA_LEVELS = [30, 90, 120]
 
 log(f"[配置] ALERT_MODE: {ALERT_MODE}")
@@ -157,7 +177,7 @@ def run_report_mode():
 class SmartAlertManager:
     def __init__(self, cooldown_minutes=15):
         self.cooldown_minutes = cooldown_minutes
-        self.cooldown_file = 'cooldown_cache.json'  # 冷却期缓存文件
+        self.cooldown_file = '/root/cooldown_cache.json'  # 冷却期缓存文件
         # 结构: {level_name: {"time": 时间戳, "state": "above"/"below"/"near_level"}}
         self.cooldown_data = self.load_cooldown_data()  # 只加载一次
     
@@ -228,7 +248,7 @@ class SmartAlertManager:
             return "near_level"
 
 # 创建智能预警管理器
-alert_manager = SmartAlertManager(cooldown_minutes=15)
+alert_manager = SmartAlertManager(cooldown_minutes=50)
 
 def run_alert_mode():
     log('[主流程] 进入关键点位预警模式...')
