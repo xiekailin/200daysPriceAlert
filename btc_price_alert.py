@@ -1,10 +1,12 @@
 import requests
 import time
 import os
+import sys
+import hmac
 import datetime
 import json
 
-LOG_PATH = '/root/btc_alert.log'
+LOG_PATH = 'btc_alert.log'
 MAX_LOG_SIZE = 5 * 1024 * 1024  # 5MB
 
 def log(msg):
@@ -47,14 +49,27 @@ def log(msg):
         f.write(line)
     print(line.strip())  # 保留原有print调试
 
+def atomic_write(path, text):
+    """先写临时文件再替换，避免进程中途退出留下半截缓存文件。"""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
 # ====== 配置部分 ======
-BARK_API_KEY = os.getenv('BARK_API_KEY', 'Znodd8yskndqUUbMVnmzBn') # 多个key用英文逗号分隔
+BARK_API_KEY = os.getenv('BARK_API_KEY', 'Znodd8yskndqUUbMVnmzBn')  # 多个key用英文逗号分隔；设置环境变量可覆盖默认key
 BARK_API_KEYS = [k.strip() for k in BARK_API_KEY.split(',') if k.strip()]
-BARK_API_URL_TEMPLATE = 'https://api.day.app/{}/'
+BARK_PUSH_URL = 'https://api.day.app/push'
 ALERT_PRICE = os.getenv('ALERT_PRICE')
 USE_MA200 = os.getenv('USE_MA200', 'false').lower() == 'true'
-ALERT_MODE = os.getenv('ALERT_MODE', 'alert')  # 'alert' 或 'report'
-CACHE_PATH = '/root/last_price.cache'
+ALERT_MODE = os.getenv('ALERT_MODE', 'alert')  # 'alert', 'report' 或 'web'
+COOLDOWN_MINUTES = int(os.getenv('COOLDOWN_MINUTES', '30'))  # 冷却时间（分钟）
+HYSTERESIS_PCT = float(os.getenv('HYSTERESIS_PCT', '0.2'))  # 关口上下缓冲带（%），价格需越过缓冲带才算突破
+PRICE_CACHE_MAX_AGE_MINUTES = int(os.getenv('PRICE_CACHE_MAX_AGE_MINUTES', '30'))  # 上次价格超过此时长视为过期
+FAIL_ALERT_THRESHOLD = int(os.getenv('FAIL_ALERT_THRESHOLD', '6'))  # 连续取价失败多少次后推送异常告警
+WEB_TOKEN = os.getenv('WEB_TOKEN', '')  # web 模式必填，调用 /report 时校验
+CACHE_PATH = 'last_price.cache'
+STATE_PATH = 'cooldown_cache.json'
 
 # ====== 关口与均线列表 ======
 IMPORTANT_LEVELS = list(range(40000, 1000000, 1000))
@@ -140,24 +155,44 @@ def get_btc_24h_change():
         return None
 
 # ====== 发送推送 ======
-def send_bark_alert(body_msg):
-    title = '🚨 BTC行情提醒'
-    for key in BARK_API_KEYS:
-        url = f"{BARK_API_URL_TEMPLATE.format(key)}{title}/{body_msg}"
-        log(f"[推送] 发送Bark通知: {url.replace(key, '***')}")
+def send_bark_alert(body_msg, title='🚨 BTC行情提醒'):
+    """通过 Bark 的 POST JSON 接口推送，避免消息里的 / # ? % 等字符破坏 URL。
+    返回是否所有设备都推送成功（以 Bark 返回 code == 200 为准）。"""
+    if not BARK_API_KEYS:
+        log('[错误] 未配置 BARK_API_KEY，跳过推送')
+        return False
+    log(f"[推送] 标题: {title} | 内容: {body_msg}")
+    all_ok = True
+    for idx, key in enumerate(BARK_API_KEYS, 1):
         try:
-            requests.get(url, timeout=10)
-            log('[推送] 通知已发送')
+            resp = requests.post(
+                BARK_PUSH_URL,
+                json={'device_key': key, 'title': title, 'body': body_msg},
+                timeout=10,
+            )
+            try:
+                code = resp.json().get('code')
+            except ValueError:
+                code = None
+            if resp.status_code == 200 and code == 200:
+                log(f'[推送] 第{idx}个设备推送成功')
+            else:
+                all_ok = False
+                # Bark 的错误信息会原样带回 device key，写日志前脱敏
+                log(f'[错误] 第{idx}个设备推送失败: HTTP {resp.status_code} {resp.text[:200].replace(key, "***")}')
         except Exception as e:
-            log(f'[错误] 推送失败: {e}')
+            all_ok = False
+            log(f'[错误] 第{idx}个设备推送异常: {str(e).replace(key, "***")}')
+    return all_ok
 
 # ====== 运行模式 ======
 def run_report_mode():
     log('[主流程] 进入定时报告模式...')
     price = get_btc_price()
     if price is None:
-        send_bark_alert("❌ 获取BTC行情失败")
-        return
+        msg = "❌ 获取BTC行情失败"
+        send_bark_alert(msg)
+        return msg
 
     change = get_btc_24h_change()
     if change is not None:
@@ -173,108 +208,158 @@ def run_report_mode():
             report_msg += f"\n📊 MA({days}): ${ma:,.0f}"
     log(f"[报告内容] {report_msg}")
     send_bark_alert(report_msg)
+    return report_msg
 
 class SmartAlertManager:
-    def __init__(self, cooldown_minutes=15):
-        self.cooldown_minutes = cooldown_minutes
-        self.cooldown_file = '/root/cooldown_cache.json'  # 冷却期缓存文件
-        # 结构: {level_name: {"time": 时间戳, "state": "above"/"below"/"near_level"}}
-        self.cooldown_data = self.load_cooldown_data()  # 只加载一次
-    
-    def load_cooldown_data(self):
+    """关口预警状态：冷却期、迟滞缓冲带、取价连续失败计数，统一持久化到 state_file。
+
+    突破判断规则：关口上下各留 hysteresis_pct% 的缓冲带，价格必须离开缓冲带、
+    且所在方向与上次确认的方向相反才算一次突破，避免价格贴着关口来回晃时反复推送。
+    """
+
+    def __init__(self, cooldown_minutes=15, hysteresis_pct=0.2, state_file=STATE_PATH):
+        self.cooldown_seconds = int(cooldown_minutes * 60)
+        self.band_ratio = hysteresis_pct / 100
+        self.state_file = state_file
+        self.cooldown = {}  # {关口名: 上次推送时间戳}，每个关口独立计时
+        # {关口名: "above"/"below"}：当前停在缓冲带内的关口，记录进入缓冲带之前确认的方向。
+        # 不在缓冲带内的关口无需记录，其方向可由上次价格直接推出。
+        self.pending = {}
+        self.fail_count = 0
+        self.fail_alerted = False
+        self.load()
+
+    def load(self):
+        if not os.path.exists(self.state_file):
+            return
         try:
-            if os.path.exists(self.cooldown_file):
-                with open(self.cooldown_file, 'r') as f:
-                    data = json.load(f)
-                    log(f"[缓存] 加载冷却期数据: {len(data)} 个关口")
-                    return data
+            with open(self.state_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
         except Exception as e:
-            log(f"[警告] 加载冷却期数据失败: {e}")
-        return {}
-    
-    def save_cooldown_data(self):
-        try:
-            with open(self.cooldown_file, 'w') as f:
-                json.dump(self.cooldown_data, f, indent=2)
-            log(f"[缓存] 保存冷却期数据: {len(self.cooldown_data)} 个关口")
-        except Exception as e:
-            log(f"[错误] 保存冷却期数据失败: {e}")
-    
-    def can_alert(self, level_name, prev_price, current_price, level):
-        current_time = time.time()
-        cooldown_minutes = self.cooldown_minutes
-        cooldown_data = self.cooldown_data
-        current_state = self.get_price_state(current_price, level)
-        cooldown_total = int(cooldown_minutes * 60)
-
-        # 冷却期内，直接跳过
-        if level_name in cooldown_data:
-            if isinstance(cooldown_data[level_name], (float, int)):
-                cooldown_data[level_name] = {"time": cooldown_data[level_name], "state": None}
-                self.save_cooldown_data()
-            last_time = cooldown_data[level_name].get("time", 0)
-            time_diff = current_time - last_time
-            if time_diff < cooldown_total:
-                remain = int(cooldown_total - time_diff)
-                log(f"[冷却期中] {level_name} 跳过推送 | 当前: {current_time:.0f} 上次: {last_time:.0f} 剩余: {remain}s/共{cooldown_total}s")
-                return False, None
-
-        # 只有穿越关口时才推送
-        is_breakthrough, direction = self.is_real_breakthrough(prev_price, current_price, level)
-        if is_breakthrough:
-            # 只保留当前关口的冷却期，清空其他关口
-            self.cooldown_data = {level_name: {"time": current_time, "state": current_state}}
-            self.save_cooldown_data()
-            log(f"[进入冷却期] {level_name} {direction}，冷却期开始: {current_time:.0f}（其他关口冷却已清空）")
-            log(f"[首次/新突破] {level_name} {direction}")
-            return True, direction
-
-        return False, None
-    
-    def is_real_breakthrough(self, prev_price, current_price, level):
-        # 只要穿越关口就算突破，不再判断距离
-        if prev_price < level <= current_price:
-            return True, "涨破"
-        elif prev_price > level >= current_price:
-            return True, "跌破"
-        return False, None
-    
-    def get_price_state(self, current_price, level):
-        if current_price > level + (level * 0.1 / 100):
-            return "above"
-        elif current_price < level - (level * 0.1 / 100):
-            return "below"
+            log(f"[警告] 加载预警状态失败: {e}")
+            return
+        if not isinstance(data, dict):
+            return
+        if data.get('version') == 2:
+            self.cooldown = {k: float(v) for k, v in data.get('cooldown', {}).items()}
+            self.pending = dict(data.get('pending', {}))
+            self.fail_count = int(data.get('fail_count', 0))
+            self.fail_alerted = bool(data.get('fail_alerted', False))
         else:
-            return "near_level"
+            # 兼容旧格式 {关口名: {"time": ts, "state": ...}} 或 {关口名: ts}
+            for name, value in data.items():
+                ts = value.get('time') if isinstance(value, dict) else value
+                if isinstance(ts, (int, float)):
+                    self.cooldown[name] = float(ts)
+        log(f"[缓存] 加载预警状态: 冷却中 {len(self.cooldown)} 个，缓冲带内 {len(self.pending)} 个")
+
+    def save(self, now=None):
+        now = time.time() if now is None else now
+        # 过期的冷却记录没有意义，保存前清理掉
+        self.cooldown = {k: v for k, v in self.cooldown.items() if now - v < self.cooldown_seconds}
+        data = {
+            'version': 2,
+            'cooldown': self.cooldown,
+            'pending': self.pending,
+            'fail_count': self.fail_count,
+            'fail_alerted': self.fail_alerted,
+        }
+        try:
+            atomic_write(self.state_file, json.dumps(data, ensure_ascii=False, indent=2))
+        except Exception as e:
+            log(f"[错误] 保存预警状态失败: {e}")
+
+    def reset_pending(self):
+        """历史价格缺失或过期时调用：旧的方向记录已不可信，全部丢弃。"""
+        self.pending = {}
+
+    def side_of(self, price, level):
+        band = level * self.band_ratio
+        if price >= level + band:
+            return 'above'
+        if price <= level - band:
+            return 'below'
+        return None  # 处于缓冲带内
+
+    def check_level(self, name, prev_price, current_price, level, now=None):
+        """返回 "涨破" / "跌破" / None。冷却期内的突破只更新方向，不推送。"""
+        now = time.time() if now is None else now
+        reference = self.pending.get(name) or ('above' if prev_price >= level else 'below')
+        current_side = self.side_of(current_price, level)
+        if current_side is None:
+            self.pending[name] = reference
+            return None
+        self.pending.pop(name, None)
+        if current_side == reference:
+            return None
+
+        direction = '涨破' if current_side == 'above' else '跌破'
+        last_time = self.cooldown.get(name)
+        if last_time is not None and now - last_time < self.cooldown_seconds:
+            remain = int(self.cooldown_seconds - (now - last_time))
+            log(f"[冷却期中] {name} {direction} 跳过推送 | 剩余: {remain}s/共{self.cooldown_seconds}s")
+            return None
+        self.cooldown[name] = now
+        log(f"[突破] {name} {direction}，进入冷却期 {self.cooldown_seconds}s")
+        return direction
 
 # 创建智能预警管理器
-alert_manager = SmartAlertManager(cooldown_minutes=50)
+alert_manager = SmartAlertManager(cooldown_minutes=COOLDOWN_MINUTES, hysteresis_pct=HYSTERESIS_PCT)
+
+def load_prev_price():
+    """返回 (上次价格, 记录时间戳)。兼容旧格式（只有价格），此时时间戳为 None。"""
+    if not os.path.exists(CACHE_PATH):
+        return None, None
+    try:
+        with open(CACHE_PATH, 'r', encoding='utf-8') as f:
+            data = json.loads(f.read().strip())
+        if isinstance(data, dict):
+            return float(data['price']), float(data['time'])
+        return float(data), None
+    except Exception as e:
+        log(f"[警告] 读取价格缓存失败: {e}")
+        return None, None
+
+def save_price(price, now=None):
+    now = time.time() if now is None else now
+    atomic_write(CACHE_PATH, json.dumps({'price': price, 'time': now}))
 
 def run_alert_mode():
     log('[主流程] 进入关键点位预警模式...')
-    prev_price = None
-    try:
-        if os.path.exists(CACHE_PATH):
-            with open(CACHE_PATH, 'r') as f:
-                prev_price = float(f.read().strip())
-                log(f"[缓存] 读取到上次价格: {prev_price:,.2f}")
-    except Exception as e:
-        log(f"[警告] 读取缓存失败: {e}")
+    prev_price, prev_time = load_prev_price()
+    if prev_price is not None:
+        log(f"[缓存] 读取到上次价格: {prev_price:,.2f}")
 
     current_price = get_btc_price()
     if current_price is None:
-        log("[错误] 本次未能获取价格，跳过。")
+        alert_manager.fail_count += 1
+        log(f"[错误] 本次未能获取价格，跳过（已连续失败 {alert_manager.fail_count} 次）")
+        if alert_manager.fail_count >= FAIL_ALERT_THRESHOLD and not alert_manager.fail_alerted:
+            # 推送成功才标记已告警，失败则下次继续尝试
+            if send_bark_alert(f"已连续 {alert_manager.fail_count} 次获取BTC价格失败，请检查服务器网络或数据源",
+                               title='⚠️ BTC监控异常'):
+                alert_manager.fail_alerted = True
+        alert_manager.save()
         return
 
-    if prev_price is None:
-        log(f"[缓存] 无历史价格, 保存当前价 {current_price:,.2f} 后退出。")
-        with open(CACHE_PATH, 'w') as f:
-            f.write(str(current_price))
+    if alert_manager.fail_alerted:
+        send_bark_alert(f"价格获取已恢复，现价 ${current_price:,.2f}", title='✅ BTC监控恢复')
+    alert_manager.fail_count = 0
+    alert_manager.fail_alerted = False
+
+    now = time.time()
+    max_age = PRICE_CACHE_MAX_AGE_MINUTES * 60
+    if prev_price is None or prev_time is None or now - prev_time > max_age:
+        reason = '无历史价格' if prev_price is None else f'历史价格缺少时间戳或已超过 {PRICE_CACHE_MAX_AGE_MINUTES} 分钟'
+        log(f"[缓存] {reason}，保存当前价 {current_price:,.2f} 后退出，本次不做突破判断。")
+        alert_manager.reset_pending()
+        alert_manager.save(now)
+        save_price(current_price, now)
         return
 
     alert_reasons = []
     levels_to_check = {}
-    
+
     # 1. 固定价格阈值 (仅在不使用MA200时生效)
     if not USE_MA200 and ALERT_PRICE:
         try:
@@ -285,28 +370,30 @@ def run_alert_mode():
     # 2. 整数关口
     for level in IMPORTANT_LEVELS:
         levels_to_check[f'整数关口 ${level:,}'] = level
-        
+
     # 3. MA均线 (包含MA200, 如果启用)
     all_ma_days = sorted(list(set(MA_LEVELS + ([200] if USE_MA200 else []))))
     for days in all_ma_days:
         ma = get_btc_ma(days)
-        if ma: 
+        if ma:
             levels_to_check[f'MA({days})'] = ma
 
     for name, level in levels_to_check.items():
-        can_alert, direction = alert_manager.can_alert(name, prev_price, current_price, level)
-        if can_alert:
+        direction = alert_manager.check_level(name, prev_price, current_price, level, now)
+        if direction:
             # 为MA均线添加价格信息到显示中
             display_name = name
             if name.startswith('MA('):
                 display_name = f"{name} ${level:,.0f}"
-            
+
             if direction == "涨破":
                 # 用 🔺 表示涨破 (通常为红色)
                 alert_reasons.append(f"🔺 涨破 {display_name}")
             elif direction == "跌破":
                 # 用 📉 表示跌破 (通常为绿色)
                 alert_reasons.append(f"📉 跌破 {display_name}")
+
+    alert_manager.save(now)
 
     if alert_reasons:
         # 将所有预警理由在一行内展示
@@ -316,13 +403,94 @@ def run_alert_mode():
     else:
         log(f"[主流程] 价格从 ${prev_price:,.2f} -> ${current_price:,.2f}, 未触发有效预警。")
 
-    with open(CACHE_PATH, 'w') as f:
-        f.write(str(current_price))
+    save_price(current_price, now)
+
+def run_web_mode():
+    # 只在 web 模式需要 flask，延迟导入，避免 cron 跑 alert/report 时因未安装 flask 而崩溃
+    from flask import Flask, jsonify, request
+
+    if not WEB_TOKEN:
+        log('[错误] web 模式必须设置 WEB_TOKEN 环境变量，否则任何人都能触发推送')
+        sys.exit(1)
+
+    app = Flask(__name__)
+
+    @app.route('/')
+    def index():
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>BTC Price Alert</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body { font-family: sans-serif; text-align: center; padding-top: 50px; background-color: #f4f4f4; color: #333; }
+                h1 { color: #0056b3; }
+                button { font-size: 1.5em; padding: 15px 30px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 5px; transition: background-color 0.3s; }
+                button:disabled { background-color: #cccccc; }
+                button:hover:not(:disabled) { background-color: #0056b3; }
+                #result { margin-top: 30px; font-size: 1.2em; white-space: pre-wrap; background-color: #fff; padding: 20px; border-radius: 5px; display: inline-block; text-align: left; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+            </style>
+        </head>
+        <body>
+            <h1>BTC 价格推送</h1>
+            <p><input id="token" type="password" placeholder="访问令牌 WEB_TOKEN" style="font-size:1.1em;padding:8px;"></p>
+            <button id="reportButton" onclick="getReport()">推送当前价格</button>
+            <div id="result"></div>
+            <script>
+                // 令牌只保存在本机浏览器，不放进 URL，避免出现在访问日志和历史记录里
+                const tokenInput = document.getElementById('token');
+                tokenInput.value = localStorage.getItem('btcAlertToken') || '';
+
+                function getReport() {
+                    localStorage.setItem('btcAlertToken', tokenInput.value);
+                    const button = document.getElementById('reportButton');
+                    const resultDiv = document.getElementById('result');
+                    button.disabled = true;
+                    button.innerText = '正在推送...';
+                    resultDiv.innerText = '';
+
+                    fetch('/report', { method: 'POST', headers: { 'X-Token': tokenInput.value } })
+                        .then(response => response.json())
+                        .then(data => {
+                            resultDiv.innerText = data.message;
+                        })
+                        .catch(error => {
+                            resultDiv.innerText = '错误: ' + error;
+                        })
+                        .finally(() => {
+                            button.disabled = false;
+                            button.innerText = '推送当前价格';
+                        });
+                }
+            </script>
+        </body>
+        </html>
+        """
+
+    @app.route('/report', methods=['POST'])
+    def report():
+        token = request.headers.get('X-Token', '')
+        if not hmac.compare_digest(token.encode('utf-8'), WEB_TOKEN.encode('utf-8')):
+            log('[Web] 拒绝令牌错误的推送请求')
+            return jsonify({"message": "令牌错误，未推送"}), 401
+        log('[Web] 收到推送请求')
+        report_message = run_report_mode()
+        return jsonify({"message": report_message})
+
+    port = 5002
+    log(f'[Web] Web服务已启动，请访问 http://0.0.0.0:{port}')
+    app.run(host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
+    if not BARK_API_KEYS:
+        log('[错误] 未设置 BARK_API_KEY 环境变量（多个用英文逗号分隔），无法推送，退出')
+        sys.exit(1)
     if ALERT_MODE == 'report':
         run_report_mode()
     elif ALERT_MODE == 'alert':
         run_alert_mode()
+    elif ALERT_MODE == 'web':
+        run_web_mode()
     else:
-        log(f"[错误] 未知的ALERT_MODE: {ALERT_MODE}") 
+        log(f"[错误] 未知的ALERT_MODE: {ALERT_MODE}")
