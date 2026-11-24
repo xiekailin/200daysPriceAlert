@@ -3,8 +3,10 @@ import time
 import os
 import sys
 import hmac
+import math
 import datetime
 import json
+import traceback
 
 LOG_PATH = 'btc_alert.log'
 MAX_LOG_SIZE = 5 * 1024 * 1024  # 5MB
@@ -44,9 +46,12 @@ def log(msg):
     except Exception as e:
         print(f"[日志裁剪错误] {e}")
     
-    # 写入新日志
-    with open(LOG_PATH, 'a', encoding='utf-8') as f:
-        f.write(line)
+    # 写入新日志；磁盘满或无权限时只打印到标准错误，不能让日志失败拖垮推送和状态保存
+    try:
+        with open(LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(line)
+    except OSError as e:
+        print(f"[日志写入错误] {e}", file=sys.stderr)
     print(line.strip())  # 保留原有print调试
 
 def atomic_write(path, text):
@@ -68,6 +73,10 @@ HYSTERESIS_PCT = float(os.getenv('HYSTERESIS_PCT', '0.2'))  # 关口上下缓冲
 PRICE_CACHE_MAX_AGE_MINUTES = int(os.getenv('PRICE_CACHE_MAX_AGE_MINUTES', '30'))  # 上次价格超过此时长视为过期
 FAIL_ALERT_THRESHOLD = int(os.getenv('FAIL_ALERT_THRESHOLD', '6'))  # 连续取价失败多少次后推送异常告警
 WEB_TOKEN = os.getenv('WEB_TOKEN', '')  # web 模式必填，调用 /report 时校验
+PRICE_JUMP_PCT = float(os.getenv('PRICE_JUMP_PCT', '10'))  # 价格相对上次变动超过此比例（%）时，用第二个数据源核对
+PRICE_CONFIRM_TOLERANCE_PCT = 1.0  # 两个数据源价格相差在此比例（%）以内视为一致
+OUTAGE_ALERT_PCT = float(os.getenv('OUTAGE_ALERT_PCT', '3'))  # 监控中断恢复后，价格变化超过此比例（%）补推一条汇总
+HTTP_TIMEOUT = (5, 10)  # (连接超时, 读取超时) 秒
 CACHE_PATH = 'last_price.cache'
 STATE_PATH = 'cooldown_cache.json'
 
@@ -81,45 +90,107 @@ log(f"[配置] USE_MA200: {USE_MA200}")
 if ALERT_MODE == 'alert':
     log(f"[配置] ALERT_PRICE: {ALERT_PRICE}")
 
-# ====== API获取函数 (与之前类似，保持不变) ======
-def get_btc_price():
-    apis = [
-        ('Coinbase', lambda: float(requests.get('https://api.coinbase.com/v2/prices/spot?currency=USD', timeout=10).json()['data']['amount'])),
-        ('Kraken', lambda: float(requests.get('https://api.kraken.com/0/public/Ticker?pair=XBTUSD', timeout=10).json()['result']['XXBTZUSD']['c'][0])),
-        ('Bitstamp', lambda: float(requests.get('https://www.bitstamp.net/api/v2/ticker/btcusd/', timeout=10).json()['last'])),
-        ('CoinGecko', lambda: float(requests.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd', timeout=10).json()['bitcoin']['usd'])),
-        ('CryptoCompare', lambda: float(requests.get('https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD', timeout=10).json()['USD'])),
-    ]
-    for name, func in apis:
+# ====== HTTP 与数据源 ======
+_session = None
+
+def get_session():
+    """共享 HTTP 连接，避免每个请求都重新握手。
+    GET 遇到连接失败或 5xx 自动重试一次；429 限流不重试也不等待 Retry-After，直接换下一个数据源。"""
+    global _session
+    if _session is None:
+        session = requests.Session()
         try:
-            price = func()
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            retry = Retry(
+                total=1, connect=1, read=0, status=1,
+                backoff_factor=0.5,
+                status_forcelist=(500, 502, 503, 504),
+                allowed_methods=frozenset(['GET']),
+                raise_on_status=False,
+                respect_retry_after_header=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            session.mount('https://', adapter)
+            session.mount('http://', adapter)
+        except (ImportError, TypeError) as e:
+            # urllib3 低于 1.26 不支持 allowed_methods；退回不重试的会话，不能让取价和告警全部失效
+            log(f"[警告] 当前 urllib3 不支持自动重试，已关闭重试: {describe_error(e)}")
+        _session = session
+    return _session
+
+def http_get_json(url):
+    """GET 并解析 JSON。先检查状态码，日志里能直接看出是限流（429）还是服务端故障（5xx）。"""
+    resp = get_session().get(url, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+def describe_error(e):
+    """带上异常类型，避免日志里只剩一个看不懂的 'bitcoin' / 'data'。"""
+    return f"{type(e).__name__}: {e}"
+
+def kraken_result(data):
+    """Kraken 出错时 HTTP 仍返回 200，错误写在 error 字段里，这里转成可读的异常。"""
+    if data.get('error'):
+        raise ValueError(f"Kraken 返回错误: {data['error']}")
+    return data['result']
+
+def validate_price(value):
+    """数据源偶尔返回 0、空值或非数字，直接当作这个数据源失败，换下一个。"""
+    price = float(value)
+    if not math.isfinite(price) or price <= 0:
+        raise ValueError(f"价格数值异常: {value!r}")
+    return price
+
+# (名称, 地址, 从响应 JSON 中取出价格的函数)
+PRICE_SOURCES = [
+    ('Coinbase', 'https://api.coinbase.com/v2/prices/spot?currency=USD',
+     lambda d: d['data']['amount']),
+    ('Kraken', 'https://api.kraken.com/0/public/Ticker?pair=XBTUSD',
+     lambda d: kraken_result(d)['XXBTZUSD']['c'][0]),
+    ('Bitstamp', 'https://www.bitstamp.net/api/v2/ticker/btcusd/',
+     lambda d: d['last']),
+    ('CoinGecko', 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd',
+     lambda d: d['bitcoin']['usd']),
+    ('CryptoCompare', 'https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD',
+     lambda d: d['USD']),
+]
+
+def fetch_price(skip=()):
+    """按顺序尝试各数据源，返回 (价格, 数据源名称)；全部失败返回 (None, None)。
+    skip 用于核对价格时排除已经用过的数据源。"""
+    for name, url, parse in PRICE_SOURCES:
+        if name in skip:
+            continue
+        try:
+            price = validate_price(parse(http_get_json(url)))
             log(f"[数据] 通过 {name} 获取到价格: {price}")
-            return price
+            return price, name
         except Exception as e:
-            log(f"[错误] {name} 获取价格失败: {e}")
-    return None
+            log(f"[错误] {name} 获取价格失败: {describe_error(e)}")
+    return None, None
+
+def get_btc_price():
+    return fetch_price()[0]
 
 def get_btc_ma(days):
     def get_from_kraken():
         url = 'https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440&since=0'
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
+        result = kraken_result(http_get_json(url))
         # Kraken might return more than `days` data, so we slice it
-        closes = [float(item[4]) for item in list(data['result'].values())[0] if isinstance(item, list)]
+        closes = [float(item[4]) for item in list(result.values())[0] if isinstance(item, list)]
         closes = closes[-days:]
         return sum(closes) / len(closes)
 
     def get_from_bitstamp():
         url = f'https://www.bitstamp.net/api/v2/ohlc/btcusd/?step=86400&limit={days}'
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
+        data = http_get_json(url)
         closes = [float(item['close']) for item in data['data']['ohlc']]
         return sum(closes) / len(closes)
 
     def get_from_coingecko():
         url = f'https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days={days}&interval=daily'
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
+        data = http_get_json(url)
         if 'prices' not in data:
             raise Exception("No 'prices' in response")
         prices = [item[1] for item in data['prices']]
@@ -140,7 +211,7 @@ def get_btc_ma(days):
             log(f"[结果] 通过 {name} 获取到 {days}日均线: {ma:.2f}")
             return ma
         except Exception as e:
-            log(f"[错误] {name} 获取 MA({days}) 失败: {e}")
+            log(f"[错误] {name} 获取 MA({days}) 失败: {describe_error(e)}")
 
     log(f'[错误] 所有API获取{days}日均线均失败')
     return None
@@ -148,10 +219,9 @@ def get_btc_ma(days):
 def get_btc_24h_change():
     try:
         url = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true'
-        resp = requests.get(url, timeout=10)
-        return float(resp.json()['bitcoin']['usd_24h_change'])
+        return float(http_get_json(url)['bitcoin']['usd_24h_change'])
     except Exception as e:
-        log(f"[错误] CoinGecko 获取24h涨跌幅失败: {e}")
+        log(f"[错误] CoinGecko 获取24h涨跌幅失败: {describe_error(e)}")
         return None
 
 # ====== 发送推送 ======
@@ -165,10 +235,10 @@ def send_bark_alert(body_msg, title='🚨 BTC行情提醒'):
     all_ok = True
     for idx, key in enumerate(BARK_API_KEYS, 1):
         try:
-            resp = requests.post(
+            resp = get_session().post(
                 BARK_PUSH_URL,
                 json={'device_key': key, 'title': title, 'body': body_msg},
-                timeout=10,
+                timeout=HTTP_TIMEOUT,
             )
             try:
                 code = resp.json().get('code')
@@ -324,13 +394,77 @@ def save_price(price, now=None):
     now = time.time() if now is None else now
     atomic_write(CACHE_PATH, json.dumps({'price': price, 'time': now}))
 
+def verify_price(reference_price, price, source):
+    """价格相对参考价变动超过 PRICE_JUMP_PCT 时，用另一个数据源核对，防止单个数据源的异常值引发大面积误报。
+    返回可信的价格；无法确认时返回 None，本轮应跳过。"""
+    change_pct = abs(price / reference_price - 1) * 100
+    if change_pct <= PRICE_JUMP_PCT:
+        return price
+    log(f"[校验] {source} 价格 ${price:,.2f} 相对上次 ${reference_price:,.2f} 变动 {change_pct:.1f}%，"
+        f"超过 {PRICE_JUMP_PCT}%，用其他数据源核对")
+    other, other_source = fetch_price(skip={source})
+    if other is None:
+        log('[校验] 没有其他可用数据源，无法确认，本轮跳过')
+        return None
+    if abs(other / price - 1) * 100 <= PRICE_CONFIRM_TOLERANCE_PCT:
+        log(f"[校验] {other_source} 价格 ${other:,.2f} 与之一致，确认有效")
+        return price
+    if abs(other / reference_price - 1) * 100 <= PRICE_JUMP_PCT:
+        # 第二个数据源的价格和上次接近，说明是第一个数据源出了问题
+        log(f"[校验] {source} 价格疑似异常，改用 {other_source} 价格 ${other:,.2f}")
+        return other
+    log(f"[校验] {source} ${price:,.2f} 与 {other_source} ${other:,.2f} 差异过大，无法确认，本轮跳过")
+    return None
+
+def format_duration(seconds):
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} 小时 {minutes} 分钟" if minutes else f"{hours} 小时"
+    days, hours = divmod(hours, 24)
+    return f"{days} 天 {hours} 小时" if hours else f"{days} 天"
+
+# 🔺 表示涨破（通常为红色），📉 表示跌破（通常为绿色）
+DIRECTION_EMOJI = {'涨破': '🔺', '跌破': '📉'}
+
+def build_alert_reasons(events):
+    """把本轮触发的关口整理成推送文案，顺序为 固定阈值 → 整数关口 → 均线。
+    同方向的多个整数关口合并成一条，避免大行情时一条通知挤满几十个关口。
+    events: [(关口名, 价位, 方向)]"""
+    fixed, ma = [], []
+    integers = {'涨破': [], '跌破': []}
+    for name, level, direction in events:
+        emoji = DIRECTION_EMOJI[direction]
+        if name.startswith('整数关口'):
+            integers[direction].append(level)
+        elif name.startswith('MA('):
+            # 为MA均线添加价格信息到显示中
+            ma.append(f"{emoji} {direction} {name} ${level:,.0f}")
+        else:
+            fixed.append(f"{emoji} {direction} {name}")
+
+    merged = []
+    for direction, levels in integers.items():
+        if not levels:
+            continue
+        # 涨破从低到高、跌破从高到低排列，和价格运动方向一致
+        levels = sorted(levels, reverse=(direction == '跌破'))
+        emoji = DIRECTION_EMOJI[direction]
+        if len(levels) == 1:
+            merged.append(f"{emoji} {direction} 整数关口 ${levels[0]:,}")
+        else:
+            merged.append(f"{emoji} 连续{direction} {len(levels)} 个整数关口（${levels[0]:,} → ${levels[-1]:,}）")
+    return fixed + merged + ma
+
 def run_alert_mode():
     log('[主流程] 进入关键点位预警模式...')
     prev_price, prev_time = load_prev_price()
     if prev_price is not None:
         log(f"[缓存] 读取到上次价格: {prev_price:,.2f}")
 
-    current_price = get_btc_price()
+    current_price, source = fetch_price()
     if current_price is None:
         alert_manager.fail_count += 1
         log(f"[错误] 本次未能获取价格，跳过（已连续失败 {alert_manager.fail_count} 次）")
@@ -342,33 +476,61 @@ def run_alert_mode():
         alert_manager.save()
         return
 
-    if alert_manager.fail_alerted:
-        send_bark_alert(f"价格获取已恢复，现价 ${current_price:,.2f}", title='✅ BTC监控恢复')
+    recovered = alert_manager.fail_alerted
     alert_manager.fail_count = 0
     alert_manager.fail_alerted = False
 
+    # 价格合理性校验：变动过大先核对，无法确认就跳过本轮，且不覆盖上次的可信价格
+    if prev_price is not None:
+        current_price = verify_price(prev_price, current_price, source)
+        if current_price is None:
+            if recovered:
+                send_bark_alert('价格获取已恢复，但当前价格未通过校验，本轮跳过', title='✅ BTC监控恢复')
+            alert_manager.save()
+            return
+
     now = time.time()
     max_age = PRICE_CACHE_MAX_AGE_MINUTES * 60
-    if prev_price is None or prev_time is None or now - prev_time > max_age:
+    is_fresh = prev_price is not None and prev_time is not None and now - prev_time <= max_age
+
+    # 监控中断（缓存过期）期间价格变化较大时补推一条汇总，避免中断期间的大行情被悄悄跳过
+    gap_msg = None
+    if not is_fresh and prev_price is not None and prev_time is not None:
+        change_pct = (current_price / prev_price - 1) * 100
+        if abs(change_pct) >= OUTAGE_ALERT_PCT:
+            emoji = '📈' if change_pct > 0 else '📉'
+            gap_msg = (f"{emoji} 监控中断约 {format_duration(now - prev_time)}，"
+                       f"期间价格 ${prev_price:,.2f} → ${current_price:,.2f}（{change_pct:+.2f}%）")
+
+    if recovered:
+        recover_msg = f"价格获取已恢复，现价 ${current_price:,.2f}"
+        send_bark_alert(f"{recover_msg}\n{gap_msg}" if gap_msg else recover_msg, title='✅ BTC监控恢复')
+    elif gap_msg:
+        send_bark_alert(gap_msg)
+
+    if not is_fresh:
         reason = '无历史价格' if prev_price is None else f'历史价格缺少时间戳或已超过 {PRICE_CACHE_MAX_AGE_MINUTES} 分钟'
-        log(f"[缓存] {reason}，保存当前价 {current_price:,.2f} 后退出，本次不做突破判断。")
+        log(f"[缓存] {reason}，保存当前价 {current_price:,.2f} 后退出，本次不做逐个关口判断。")
         alert_manager.reset_pending()
         alert_manager.save(now)
         save_price(current_price, now)
         return
 
-    alert_reasons = []
     levels_to_check = {}
 
     # 1. 固定价格阈值 (仅在不使用MA200时生效)
+    fixed_price = None
     if not USE_MA200 and ALERT_PRICE:
         try:
-            levels_to_check[f'固定阈值 ${float(ALERT_PRICE):,.0f}'] = float(ALERT_PRICE)
+            fixed_price = float(ALERT_PRICE)
+            levels_to_check[f'固定阈值 ${fixed_price:,.0f}'] = fixed_price
         except (ValueError, TypeError):
             log(f"[警告] 无效的 ALERT_PRICE 值: {ALERT_PRICE}")
 
-    # 2. 整数关口
+    # 2. 整数关口（与固定阈值同价位时只保留固定阈值，避免同一价位推两次）
     for level in IMPORTANT_LEVELS:
+        if level == fixed_price:
+            continue
         levels_to_check[f'整数关口 ${level:,}'] = level
 
     # 3. MA均线 (包含MA200, 如果启用)
@@ -378,23 +540,15 @@ def run_alert_mode():
         if ma:
             levels_to_check[f'MA({days})'] = ma
 
+    events = []
     for name, level in levels_to_check.items():
         direction = alert_manager.check_level(name, prev_price, current_price, level, now)
         if direction:
-            # 为MA均线添加价格信息到显示中
-            display_name = name
-            if name.startswith('MA('):
-                display_name = f"{name} ${level:,.0f}"
-
-            if direction == "涨破":
-                # 用 🔺 表示涨破 (通常为红色)
-                alert_reasons.append(f"🔺 涨破 {display_name}")
-            elif direction == "跌破":
-                # 用 📉 表示跌破 (通常为绿色)
-                alert_reasons.append(f"📉 跌破 {display_name}")
+            events.append((name, level, direction))
 
     alert_manager.save(now)
 
+    alert_reasons = build_alert_reasons(events)
     if alert_reasons:
         # 将所有预警理由在一行内展示
         alert_msg = f"💰 现价: ${current_price:,.2f}  " + "  ".join(alert_reasons)
@@ -482,15 +636,63 @@ def run_web_mode():
     log(f'[Web] Web服务已启动，请访问 http://0.0.0.0:{port}')
     app.run(host='0.0.0.0', port=port)
 
-if __name__ == '__main__':
+# ====== 异常兜底 ======
+def crash_marker_path():
+    # 按模式区分，避免 report 模式的异常被 alert 模式的正常运行误判为"已恢复"
+    return f'crash_alert_{ALERT_MODE}.json'
+
+def notify_crash(exc):
+    """未捕获异常：记录完整堆栈并推送告警。同一位置的同类异常只推一次，直到恢复正常。"""
+    log(f"[崩溃] 未捕获异常:\n{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}")
+    frames = traceback.extract_tb(exc.__traceback__)
+    where = f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}" if frames else '未知位置'
+    # 用异常类型 + 出错位置做标识，异常消息里常带时间、数值，不适合用来判断是否同一问题
+    signature = f"{type(exc).__name__}@{where}"
+    marker = crash_marker_path()
+    try:
+        with open(marker, 'r', encoding='utf-8') as f:
+            last = json.load(f)
+        if isinstance(last, dict) and last.get('signature') == signature:
+            log('[崩溃] 同一异常已推送过告警，本次不重复推送')
+            return
+    except (OSError, ValueError):
+        pass  # 没有标记或标记损坏：按首次异常处理
+    body = f"{ALERT_MODE} 模式运行异常：{type(exc).__name__}: {str(exc)[:200]}（{where}），详见日志"
+    if send_bark_alert(body, title='⚠️ BTC脚本异常'):
+        try:
+            atomic_write(marker, json.dumps({'signature': signature, 'time': time.time()}, ensure_ascii=False))
+        except OSError as e:
+            log(f"[错误] 写入异常标记失败: {e}")
+
+def clear_crash_marker():
+    """本次正常跑完：如果之前推送过异常告警，推一条恢复通知并清除标记（推送失败则下次再试）。"""
+    marker = crash_marker_path()
+    if not os.path.exists(marker):
+        return
+    if send_bark_alert(f"{ALERT_MODE} 模式已恢复正常运行", title='✅ BTC脚本恢复'):
+        try:
+            os.remove(marker)
+        except OSError as e:
+            log(f"[错误] 删除异常标记失败: {e}")
+
+def main():
     if not BARK_API_KEYS:
         log('[错误] 未设置 BARK_API_KEY 环境变量（多个用英文逗号分隔），无法推送，退出')
         sys.exit(1)
-    if ALERT_MODE == 'report':
-        run_report_mode()
-    elif ALERT_MODE == 'alert':
-        run_alert_mode()
-    elif ALERT_MODE == 'web':
-        run_web_mode()
-    else:
-        log(f"[错误] 未知的ALERT_MODE: {ALERT_MODE}")
+    runners = {'report': run_report_mode, 'alert': run_alert_mode, 'web': run_web_mode}
+    runner = runners.get(ALERT_MODE)
+    if runner is None:
+        # 抛出异常走兜底流程：推送告警并以非 0 退出码结束，cron 写错模式时也能发现
+        raise ValueError(f"未知的ALERT_MODE: {ALERT_MODE}")
+    runner()
+    clear_crash_marker()
+
+def run():
+    try:
+        main()
+    except Exception as exc:  # SystemExit / KeyboardInterrupt 不属于 Exception，仍按原样退出
+        notify_crash(exc)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    run()
